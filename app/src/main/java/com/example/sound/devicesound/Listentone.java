@@ -8,7 +8,9 @@ import android.util.Log;
 import org.apache.commons.math3.complex.Complex;
 import org.apache.commons.math3.transform.*;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 
 public class Listentone {
 
@@ -27,6 +29,11 @@ public class Listentone {
     private int mAudioFormat = AudioFormat.ENCODING_PCM_16BIT;
     private float interval = 0.1f;
 
+    int bufferedReadResult= 0;
+    int blocksize=0;
+    short[] buffer =null;//아래서도 쓰기 위해 전역변수로 설정함
+    ArrayList<Integer> bit_chunks=new ArrayList<Integer>();
+
     private int mBufferSize = AudioRecord.getMinBufferSize(mSampleRate, mChannelCount, mAudioFormat);
 
     public AudioRecord mAudioRecord = null;
@@ -35,19 +42,198 @@ public class Listentone {
     FastFourierTransformer transform;
 
 
-    public Listentone(){
+    public Listentone() {//객체 만들어질 때 자동 생성
 
         transform = new FastFourierTransformer(DftNormalization.STANDARD);
         startFlag = false;
         mAudioRecord = new AudioRecord(mAudioSource, mSampleRate, mChannelCount, mAudioFormat, mBufferSize);
         mAudioRecord.startRecording();
 
+        blocksize = findPowerSize((int)(long)Math.round(interval/2*mSampleRate));
+        buffer = new short[blocksize];
 
+    }
+
+        private int findPowerSize(int round) {//transform.transform은 2의 거듭제곱만 가능하다.(매개변수로 받은 수에 가장 가까운 2의 거듭제곱 값 리턴)
+
+        int n =0;
+        while(true){
+            if( ((int)Math.pow(2, n) <= round) && ((int)Math.pow(2, n+1) >= round) ){
+                break;
+            }
+          n++;
+        }
+
+        return (int)Math.pow(2, n);
+    }
+
+
+    private int findFrequency(double[] toTransform) {
+        int len = toTransform.length;
+        double[] real = new double[len];//chunk
+        double[] img = new double[len];
+        double realNum;
+        double imgNum;
+        double[] mag = new double[len];
+
+        //푸리에 변환 "복소수"
+        Complex[] complex = transform.transform(toTransform, TransformType.FORWARD);
+
+
+        for (int i = 0; i < complex.length; i++) {
+            realNum = complex[i].getReal();
+            imgNum = complex[i].getImaginary();
+            mag[i] = Math.sqrt((realNum * realNum) + (imgNum * imgNum));
+        }
+
+        Double[] freq = this.fftfreq(complex.length,1.0);//분해능 추출
+
+//------------------np.argmax "푸리에 변환 결과중 최대값 인덱스 뽑아내기"
+        double findMax=mag[0];
+        int findMax_index=0;
+        for (int i = 0; i < complex.length; i++) {
+
+            if (findMax < mag[i]) {
+                findMax = mag[i];//findMax보다 더 큰애 발견하면 값 넣어주기
+                findMax_index = i;//해당 인덱스도 추출
+            }
+        }
+
+//----------------------------------
+            double peak_freq=freq[findMax_index];
+
+        return Math.abs((int)(mSampleRate*peak_freq));
 
 
     }
 
 
+    private Double[] fftfreq(int length, Double duration) {
+
+        double N = ((double)(length-1)/2) + 1;
+        int N_int = (length-1)/2 + 1;
+
+        Double[] result=new Double[length];
+
+        for(int t=0;t<N_int; t++){
+            result[t]=(double)t*(1/(double)(2.0*(N-1)));
+        }
+
+        for(int r=0;r<N_int; r++){
+            result[N_int+r]=-(double)((N_int-r)*(1/(double)(2.0*(N-1))));
+        }
+
+        return result;
+
+    }
+
+    private ArrayList<Integer> extract_packet(ArrayList<Integer> packet) {
+
+        ArrayList<Integer> freqs=new ArrayList<Integer>();
+        for(int t=0; t<(packet.size()/2)-1; t++){
+
+            freqs.add(packet.get((t*2)+2));//시작 주파수 8비트 빼자(+2)
+        }
+
+        for(int i=0; i<freqs.size(); i++) {
+             int temp=((int)(Math.round((freqs.get(i)-START_HZ)/STEP_HZ)));
+
+
+             if((0<=temp)&&(temp<16)) {//0~16사이 인지 검사해서 넣기
+                 bit_chunks.add(temp);
+
+             }
+        }
+//--------------------decode_bitchunks
+
+        ArrayList<Integer> out_bytes=new ArrayList<Integer>();
+
+        int next_read_chunk = 0;
+        int next_read_bit = 0;
+
+        int byte_temp = 0;
+        int bits_left = 8;
+        while (next_read_chunk < bit_chunks.size()) {
+            int can_fill = BITS - next_read_bit;
+            int to_fill = (bits_left>can_fill)? can_fill:bits_left ;//최소값 넣기
+            int offset = BITS - next_read_bit - to_fill;
+            byte_temp <<=to_fill;
+            int shifted = bit_chunks.get(next_read_chunk) & (((1 << to_fill) - 1) << offset);
+            byte_temp |=shifted >> offset;
+            bits_left -= to_fill;
+            next_read_bit += to_fill;
+            if (bits_left <= 0) {
+                out_bytes.add(byte_temp);
+                //Log.d("ListenToneWord", "byte_temp: "+byte_temp);
+                byte_temp = 0;
+                bits_left = 8;
+            }
+            if (next_read_bit >= BITS) {
+                next_read_chunk += 1;
+                next_read_bit -= BITS;
+            }
+        }
+    //----------------------------
+
+        bit_chunks.clear();//다 쓰면 비우기
+        return out_bytes;
+    }
+
+
+    public void PreRequest() {
+
+        boolean in_packet = false;
+        ArrayList<Integer> packet= new ArrayList<Integer>();
+        double[] chunk= new double[blocksize];
+        int dom=0;
+
+        ArrayList<Integer> out_bytes_display=new ArrayList<Integer>();
+
+
+        while (true) {
+
+            bufferedReadResult = mAudioRecord.read(buffer,0,blocksize);
+            if(bufferedReadResult<0){//0이상의 양의 정수를 리턴하는게 정상
+                continue;
+            }
+
+            for(int t=0; t<blocksize; t++){
+                double temp=buffer[t];
+                chunk[t]=temp;
+            }
+
+            dom = this.findFrequency(chunk);
+            if (in_packet && ((dom>=HANDSHAKE_END_HZ-20)&&(dom<=HANDSHAKE_END_HZ+20))) {
+                out_bytes_display = extract_packet(packet);
+
+                String to_print= "";
+                for(int t=0; t<out_bytes_display.size(); t++) {
+                    int char_temp=out_bytes_display.get(t);
+
+                    Log.d("ListenToneWord", t+": "+(char) char_temp);
+                    to_print=to_print+((char) char_temp);
+                }
+                out_bytes_display.clear();
+                Log.d("ListenToneWord", to_print);
+                packet.clear();
+                in_packet = false;
+            }
+            else if(in_packet) {
+                packet.add(dom);
+            }
+            else if ((dom>=HANDSHAKE_START_HZ-20)&&(dom<=HANDSHAKE_START_HZ+20)) {
+                in_packet = true;
+            }
+
+
+
+        }
+
+
+
+
+
+    }
 
 
 }
